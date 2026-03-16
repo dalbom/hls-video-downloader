@@ -1,0 +1,96 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install flask requests pyinstaller
+
+      - name: Download ffmpeg
+        run: |
+          curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          7z x ffmpeg.zip -offmpeg_extract
+          mkdir ffmpeg_bin
+          Get-ChildItem -Path ffmpeg_extract -Recurse -Filter "ffmpeg.exe" | Copy-Item -Destination ffmpeg_bin/ffmpeg.exe
+        shell: pwsh
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed --name "HLS-Downloader" --add-data "templates;templates" --add-data "ffmpeg_bin/ffmpeg.exe;ffmpeg" app.py
+
+      - name: Create zip
+        run: |
+          cd dist
+          7z a ../HLS-Downloader-Windows.zip "HLS-Downloader"
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: HLS-Downloader-Windows.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install flask requests pyinstaller
+
+      - name: Install ffmpeg
+        run: |
+          brew install ffmpeg
+          mkdir -p ffmpeg_bin
+          cp $(which ffmpeg) ffmpeg_bin/ffmpeg
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed --name "HLS-Downloader" --add-data "templates:templates" --add-data "ffmpeg_bin/ffmpeg:ffmpeg" app.py
+
+      - name: Create zip
+        run: |
+          cd dist
+          zip -r ../HLS-Downloader-macOS.zip "HLS-Downloader.app" 2>/dev/null || zip -r ../HLS-Downloader-macOS.zip "HLS-Downloader"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: HLS-Downloader-macOS.zip
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-build
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            HLS-Downloader-Windows.zip
+            HLS-Downloader-macOS.zip
+          generate_release_notes: true

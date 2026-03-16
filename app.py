@@ -1,21 +1,33 @@
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Thread, Timer
 from urllib.parse import urljoin
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 
-app = Flask(__name__)
+# PyInstaller 번들 지원
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys._MEIPASS)
+    FFMPEG_BIN = str(BASE_DIR / "ffmpeg" / ("ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"))
+else:
+    BASE_DIR = Path(__file__).parent
+    FFMPEG_BIN = "ffmpeg"
 
-DOWNLOAD_DIR = Path(__file__).parent / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+
+DOWNLOAD_DIR = Path.home() / "Downloads" / "HLS-Downloader"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # 진행 중인 작업 상태
 jobs = {}
@@ -220,22 +232,24 @@ def process_download(job_id, page_url):
         output_path = DOWNLOAD_DIR / output_name
 
         cmd = [
-            "ffmpeg", "-f", "concat", "-safe", "0",
+            FFMPEG_BIN, "-f", "concat", "-safe", "0",
             "-i", str(concat_file),
             "-c", "copy", "-bsf:a", "aac_adtstoasc",
             str(output_path), "-y"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
 
         if result.returncode != 0 and not output_path.exists():
             # bsf 없이 재시도
             cmd = [
-                "ffmpeg", "-f", "concat", "-safe", "0",
+                FFMPEG_BIN, "-f", "concat", "-safe", "0",
                 "-i", str(concat_file),
                 "-c", "copy",
                 str(output_path), "-y"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
 
         if not output_path.exists():
             job["status"] = "error"
@@ -284,7 +298,6 @@ def start_download():
         "file_size": None,
     }
 
-    from threading import Thread
     t = Thread(target=process_download, args=(job_id, page_url), daemon=True)
     t.start()
 
@@ -329,5 +342,12 @@ def cleanup_file(filename):
     return jsonify({"ok": True})
 
 
+def open_browser():
+    webbrowser.open("http://localhost:5000")
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    is_frozen = getattr(sys, "frozen", False)
+    if is_frozen:
+        Timer(1.5, open_browser).start()
+    app.run(host="127.0.0.1", port=5000, debug=not is_frozen)

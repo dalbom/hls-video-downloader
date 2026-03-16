@@ -2,7 +2,7 @@
 
 [한국어](README.md)
 
-A web application for downloading HLS (HTTP Live Streaming) videos.
+A desktop application for downloading HLS (HTTP Live Streaming) videos.
 Enter a video page URL and it will automatically detect the HLS stream, download all segments, and merge them into a single MP4 file.
 
 ## Features
@@ -15,69 +15,44 @@ Enter a video page URL and it will automatically detect the HLS stream, download
 - Download cancellation
 - Automatic segment cleanup after merge
 
-## Prerequisites
-
-### Python 3.10+
-
-#### Windows
-Install from [python.org](https://www.python.org/downloads/) or use micromamba/conda:
-```bash
-micromamba create -n hlsdl python=3.12 flask requests -c conda-forge -y
-```
-
-#### macOS
-```bash
-brew install python3
-```
-
-#### Linux (Ubuntu/Debian)
-```bash
-sudo apt install python3 python3-pip
-```
-
-### FFmpeg
-
-Required for merging video segments.
-
-#### Windows
-Download the essentials build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), extract it, and add the `bin` folder to your system PATH.
-
-Or use winget:
-```bash
-winget install Gyan.FFmpeg
-```
-
-#### macOS
-```bash
-brew install ffmpeg
-```
-
-#### Linux (Ubuntu/Debian)
-```bash
-sudo apt install ffmpeg
-```
-
-### Verify Installation
-```bash
-python --version   # Python 3.10 or higher
-ffmpeg -version    # Should print version info
-```
-
 ## Installation & Usage
+
+### Option 1: Download pre-built binary (Recommended)
+
+No installation required.
+
+1. Download the file for your OS from the [Releases](https://github.com/dalbom/hls-video-downloader/releases) page
+   - Windows: `HLS-Downloader-Windows.zip`
+   - macOS: `HLS-Downloader-macOS.zip`
+2. Extract the archive
+3. Run `HLS-Downloader`
+4. Your browser will open automatically
+
+Downloaded videos are saved to `~/Downloads/HLS-Downloader/`.
+
+### Option 2: Run from source
+
+Requires Python 3.10+ and FFmpeg.
+
+#### Install Python
+
+- **Windows**: [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12`
+- **macOS**: `brew install python3`
+- **Linux**: `sudo apt install python3 python3-pip`
+
+#### Install FFmpeg
+
+- **Windows**: `winget install Gyan.FFmpeg` or download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and add to PATH
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `sudo apt install ffmpeg`
+
+#### Run
 
 ```bash
 git clone https://github.com/dalbom/hls-video-downloader.git
 cd hls-video-downloader
 pip install flask requests
 python app.py
-```
-
-With micromamba:
-```bash
-git clone https://github.com/dalbom/hls-video-downloader.git
-cd hls-video-downloader
-micromamba create -n hlsdl python=3.12 flask requests -c conda-forge -y
-micromamba run -n hlsdl python app.py
 ```
 
 Open http://localhost:5000 in your browser and enter a video page URL.
