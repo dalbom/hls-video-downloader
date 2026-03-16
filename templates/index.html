@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HLS Video Downloader</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f0f0f;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .container {
+    width: 100%;
+    max-width: 600px;
+    padding: 20px;
+  }
+  h1 {
+    text-align: center;
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+    color: #fff;
+  }
+  .subtitle {
+    text-align: center;
+    color: #888;
+    font-size: 0.85rem;
+    margin-bottom: 32px;
+  }
+  .input-group {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+  input[type="text"] {
+    flex: 1;
+    padding: 12px 16px;
+    border: 1px solid #333;
+    border-radius: 8px;
+    background: #1a1a1a;
+    color: #fff;
+    font-size: 0.95rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  input[type="text"]:focus { border-color: #4a9eff; }
+  input[type="text"]::placeholder { color: #555; }
+  button {
+    padding: 12px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-primary {
+    background: #4a9eff;
+    color: #fff;
+  }
+  .btn-primary:hover { background: #3a8eef; }
+  .btn-primary:disabled {
+    background: #333;
+    color: #666;
+    cursor: not-allowed;
+  }
+
+  .status-card {
+    display: none;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+  .status-card.active { display: block; }
+  .status-text {
+    font-size: 0.95rem;
+    margin-bottom: 16px;
+    color: #ccc;
+  }
+  .progress-bar-container {
+    width: 100%;
+    height: 8px;
+    background: #333;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #4a9eff, #7b61ff);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+    width: 0%;
+  }
+  .progress-text {
+    font-size: 0.8rem;
+    color: #888;
+    text-align: right;
+  }
+
+  .result-card {
+    display: none;
+    background: #1a1a1a;
+    border: 1px solid #2a5a2a;
+    border-radius: 12px;
+    padding: 24px;
+  }
+  .result-card.active { display: block; }
+  .result-card .check {
+    color: #4caf50;
+    font-size: 1.2rem;
+    margin-bottom: 12px;
+  }
+  .result-info {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 16px;
+  }
+  .btn-group {
+    display: flex;
+    gap: 8px;
+  }
+  .btn-download {
+    background: #4caf50;
+    color: #fff;
+    flex: 1;
+  }
+  .btn-download:hover { background: #43a047; }
+  .btn-delete {
+    background: #333;
+    color: #e0e0e0;
+  }
+  .btn-delete:hover { background: #c62828; color: #fff; }
+  .btn-new {
+    background: #333;
+    color: #e0e0e0;
+  }
+  .btn-new:hover { background: #444; }
+  .btn-cancel {
+    background: #c62828;
+    color: #fff;
+    margin-top: 16px;
+    width: 100%;
+  }
+  .btn-cancel:hover { background: #e53935; }
+
+  .error-card {
+    display: none;
+    background: #1a1a1a;
+    border: 1px solid #5a2a2a;
+    border-radius: 12px;
+    padding: 24px;
+    color: #ef5350;
+  }
+  .error-card.active { display: block; }
+
+  .history { margin-top: 32px; }
+  .history h3 {
+    font-size: 0.9rem;
+    color: #888;
+    margin-bottom: 12px;
+  }
+  .history-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+    font-size: 0.85rem;
+  }
+  .history-item .name { color: #ccc; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .history-item .size { color: #888; margin: 0 12px; white-space: nowrap; }
+  .history-item .actions { display: flex; gap: 6px; }
+  .history-item button {
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    border-radius: 6px;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+  .pulsing { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>HLS Video Downloader</h1>
+  <p class="subtitle">동영상 페이지 URL을 입력하면 자동으로 다운로드합니다</p>
+
+  <div class="input-group">
+    <input type="text" id="urlInput" placeholder="https://example.com/video-page" />
+    <button class="btn-primary" id="downloadBtn" onclick="startDownload()">다운로드</button>
+  </div>
+
+  <div class="status-card" id="statusCard">
+    <div class="status-text" id="statusText">준비 중...</div>
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="progress-text" id="progressText"></div>
+    <button class="btn-cancel" id="cancelBtn" onclick="cancelDownload()">취소</button>
+  </div>
+
+  <div class="error-card" id="errorCard">
+    <strong>오류 발생</strong>
+    <p id="errorText" style="margin-top:8px;"></p>
+    <button class="btn-new" style="margin-top:12px;" onclick="resetUI()">다시 시도</button>
+  </div>
+
+  <div class="result-card" id="resultCard">
+    <div class="check">다운로드 완료</div>
+    <div class="result-info" id="resultInfo"></div>
+    <div class="btn-group">
+      <button class="btn-download" id="saveBtn">파일 저장</button>
+      <button class="btn-delete" id="deleteBtn">서버에서 삭제</button>
+      <button class="btn-new" onclick="resetUI()">새 다운로드</button>
+    </div>
+  </div>
+
+  <div class="history" id="historySection" style="display:none;">
+    <h3>이전 다운로드</h3>
+    <div id="historyList"></div>
+  </div>
+</div>
+
+<script>
+let currentJobId = null;
+let pollTimer = null;
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+
+function resetUI() {
+  document.getElementById('statusCard').classList.remove('active');
+  document.getElementById('errorCard').classList.remove('active');
+  document.getElementById('resultCard').classList.remove('active');
+  document.getElementById('downloadBtn').disabled = false;
+  document.getElementById('urlInput').disabled = false;
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressText').textContent = '';
+  document.getElementById('cancelBtn').disabled = false;
+  document.getElementById('cancelBtn').textContent = '취소';
+  currentJobId = null;
+  if (pollTimer) clearInterval(pollTimer);
+}
+
+async function startDownload() {
+  const url = document.getElementById('urlInput').value.trim();
+  if (!url) return;
+
+  resetUI();
+  document.getElementById('downloadBtn').disabled = true;
+  document.getElementById('urlInput').disabled = true;
+  document.getElementById('statusCard').classList.add('active');
+  document.getElementById('statusText').textContent = '요청 전송 중...';
+  document.getElementById('statusText').classList.add('pulsing');
+
+  try {
+    const resp = await fetch('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    currentJobId = data.job_id;
+    pollTimer = setInterval(() => pollStatus(data.job_id), 500);
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+async function cancelDownload() {
+  if (!currentJobId) return;
+  document.getElementById('cancelBtn').disabled = true;
+  document.getElementById('cancelBtn').textContent = '취소 중...';
+  await fetch(`/api/cancel/${currentJobId}`, { method: 'POST' });
+}
+
+async function pollStatus(jobId) {
+  try {
+    const resp = await fetch(`/api/status/${jobId}`);
+    const job = await resp.json();
+
+    if (job.status === 'done') {
+      clearInterval(pollTimer);
+      showResult(job);
+    } else if (job.status === 'cancelled') {
+      clearInterval(pollTimer);
+      resetUI();
+    } else if (job.status === 'error') {
+      clearInterval(pollTimer);
+      showError(job.error);
+    } else {
+      document.getElementById('statusText').textContent = job.status;
+      if (job.total_segments > 0) {
+        const pct = Math.round((job.downloaded_segments / job.total_segments) * 100);
+        document.getElementById('progressBar').style.width = pct + '%';
+        document.getElementById('progressText').textContent =
+          `${job.downloaded_segments} / ${job.total_segments} 세그먼트 (${pct}%)`;
+      }
+    }
+  } catch (e) { /* ignore poll errors */ }
+}
+
+function showError(msg) {
+  document.getElementById('statusCard').classList.remove('active');
+  document.getElementById('errorCard').classList.add('active');
+  document.getElementById('errorText').textContent = msg;
+  document.getElementById('downloadBtn').disabled = false;
+  document.getElementById('urlInput').disabled = false;
+}
+
+function showResult(job) {
+  document.getElementById('statusCard').classList.remove('active');
+  document.getElementById('resultCard').classList.add('active');
+  document.getElementById('resultInfo').textContent = `${job.filename} (${formatSize(job.file_size)})`;
+
+  const saveBtn = document.getElementById('saveBtn');
+  saveBtn.onclick = () => {
+    window.location.href = `/api/file/${job.filename}`;
+  };
+
+  const deleteBtn = document.getElementById('deleteBtn');
+  deleteBtn.onclick = async () => {
+    await fetch(`/api/cleanup/${job.filename}`, { method: 'DELETE' });
+    resetUI();
+    document.getElementById('downloadBtn').disabled = false;
+    document.getElementById('urlInput').disabled = false;
+  };
+}
+
+document.getElementById('urlInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startDownload();
+});
+</script>
+</body>
+</html>
