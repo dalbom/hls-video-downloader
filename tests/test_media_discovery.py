@@ -7,6 +7,25 @@ import app
 
 
 class MediaDiscoveryTests(unittest.TestCase):
+    def test_default_download_directory_is_app_subfolder(self):
+        self.assertEqual(app.DOWNLOAD_DIR, Path.home() / "Downloads" / "HLS-Downloader")
+
+    def test_output_name_keeps_single_file_name_and_numbers_batches(self):
+        self.assertEqual(app.output_name_for_job("abc123", 1, 1), "video_abc123.mp4")
+        self.assertEqual(app.output_name_for_job("abc123", 1, 12), "video_abc123_001.mp4")
+        self.assertEqual(app.output_name_for_job("abc123", 12, 12), "video_abc123_012.mp4")
+
+    def test_preferred_media_sources_use_hls_before_mp4_fallbacks(self):
+        hls_sources = [("https://cdn.example.com/video.m3u8", "https://example.com/watch/1")]
+        mp4_sources = [("https://cdn.example.com/video.mp4", "https://example.com/watch/1")]
+
+        self.assertEqual(app.preferred_media_sources(hls_sources, mp4_sources), [
+            ("hls", "https://cdn.example.com/video.m3u8", "https://example.com/watch/1")
+        ])
+        self.assertEqual(app.preferred_media_sources([], mp4_sources), [
+            ("mp4", "https://cdn.example.com/video.mp4", "https://example.com/watch/1")
+        ])
+
     def test_finds_iframe_urls(self):
         html = '<iframe src="//player.example.com/embed/abc"></iframe><iframe src="/local/embed"></iframe>'
 
@@ -101,6 +120,82 @@ class MediaDiscoveryTests(unittest.TestCase):
             )
 
         app.jobs.pop("job2", None)
+
+    def test_process_download_downloads_all_discovered_mp4_sources(self):
+        sources = [
+            ("https://cdn.example.com/one.mp4", "https://example.com/watch/1"),
+            ("https://cdn.example.com/two.mp4", "https://example.com/watch/1"),
+        ]
+
+        def fake_download(job_id, media_url, referer_url, output_path):
+            output_path.write_bytes(media_url.rsplit("/", 1)[-1].encode("utf-8"))
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir)
+            app.jobs["batch1"] = {
+                "status": "starting",
+                "total_segments": 0,
+                "downloaded_segments": 0,
+                "error": None,
+                "filename": None,
+                "file_size": None,
+                "files": [],
+            }
+
+            with (
+                patch("app.DOWNLOAD_DIR", download_dir),
+                patch("app.discover_media_sources", return_value=([], sources)),
+                patch("app.download_direct_media", side_effect=fake_download) as download,
+                patch("app.apply_source_metadata", return_value=True) as metadata,
+            ):
+                app.process_download("batch1", "https://example.com/watch/1")
+
+            job = app.jobs["batch1"]
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["total_files"], 2)
+            self.assertEqual(job["downloaded_files"], 2)
+            self.assertEqual(job["download_dir"], str(download_dir))
+            self.assertEqual([file["filename"] for file in job["files"]], [
+                "video_batch1_001.mp4",
+                "video_batch1_002.mp4",
+            ])
+            self.assertEqual(download.call_count, 2)
+            self.assertEqual(metadata.call_count, 2)
+            self.assertEqual(
+                [call.args[1] for call in metadata.call_args_list],
+                ["https://example.com/watch/1", "https://example.com/watch/1"],
+            )
+            self.assertTrue((download_dir / "video_batch1_001.mp4").exists())
+            self.assertTrue((download_dir / "video_batch1_002.mp4").exists())
+
+        app.jobs.pop("batch1", None)
+
+    def test_cleanup_file_removes_file_from_batch_job(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir)
+            first_file = download_dir / "video_batch_001.mp4"
+            second_file = download_dir / "video_batch_002.mp4"
+            first_file.write_bytes(b"one")
+            second_file.write_bytes(b"two")
+            app.jobs["batch-cleanup"] = {
+                "status": "done",
+                "files": [
+                    {"filename": first_file.name, "file_size": first_file.stat().st_size},
+                    {"filename": second_file.name, "file_size": second_file.stat().st_size},
+                ],
+            }
+
+            with patch("app.DOWNLOAD_DIR", download_dir):
+                response = app.app.test_client().delete(f"/api/cleanup/{first_file.name}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(first_file.exists())
+            self.assertEqual(app.jobs["batch-cleanup"]["files"], [
+                {"filename": second_file.name, "file_size": second_file.stat().st_size}
+            ])
+
+        app.jobs.pop("batch-cleanup", None)
 
 
 if __name__ == "__main__":

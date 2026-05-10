@@ -121,7 +121,56 @@
   .result-info {
     font-size: 0.85rem;
     color: #888;
+    margin-bottom: 8px;
+  }
+  .download-path {
+    font-size: 0.78rem;
+    color: #777;
     margin-bottom: 16px;
+    word-break: break-all;
+  }
+  .result-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .result-file {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: #141414;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .file-main {
+    flex: 1;
+    min-width: 0;
+  }
+  .file-name {
+    color: #ddd;
+    font-size: 0.86rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-size {
+    color: #888;
+    font-size: 0.76rem;
+    margin-top: 4px;
+  }
+  .file-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .file-actions button {
+    min-height: 36px;
+    padding: 8px 10px;
+    font-size: 0.78rem;
+    border-radius: 6px;
+    white-space: nowrap;
   }
   .btn-group {
     display: flex;
@@ -192,6 +241,15 @@
     50% { opacity: 0.5; }
   }
   .pulsing { animation: pulse 1.5s ease-in-out infinite; }
+
+  @media (max-width: 520px) {
+    .input-group { flex-direction: column; }
+    .result-file {
+      align-items: stretch;
+      flex-direction: column;
+    }
+    .file-actions button { flex: 1; }
+  }
 </style>
 </head>
 <body>
@@ -222,10 +280,10 @@
   <div class="result-card" id="resultCard">
     <div class="check">다운로드 완료</div>
     <div class="result-info" id="resultInfo"></div>
+    <div class="download-path" id="downloadPath"></div>
+    <div class="result-list" id="resultList"></div>
     <div class="btn-group">
-      <button class="btn-download" id="saveBtn">파일 저장</button>
-      <button class="btn-delete" id="deleteBtn">서버에서 삭제</button>
-      <button class="btn-new" onclick="resetUI()">새 다운로드</button>
+      <button class="btn-new" onclick="resetUI({ clearUrl: true })">새 다운로드</button>
     </div>
   </div>
 
@@ -246,14 +304,20 @@ function formatSize(bytes) {
   return (bytes / 1073741824).toFixed(2) + ' GB';
 }
 
-function resetUI() {
+function resetUI(options = {}) {
   document.getElementById('statusCard').classList.remove('active');
   document.getElementById('errorCard').classList.remove('active');
   document.getElementById('resultCard').classList.remove('active');
   document.getElementById('downloadBtn').disabled = false;
   document.getElementById('urlInput').disabled = false;
+  if (options.clearUrl) {
+    document.getElementById('urlInput').value = '';
+  }
   document.getElementById('progressBar').style.width = '0%';
   document.getElementById('progressText').textContent = '';
+  document.getElementById('resultInfo').textContent = '';
+  document.getElementById('downloadPath').textContent = '';
+  document.getElementById('resultList').innerHTML = '';
   document.getElementById('cancelBtn').disabled = false;
   document.getElementById('cancelBtn').textContent = '취소';
   currentJobId = null;
@@ -313,8 +377,9 @@ async function pollStatus(jobId) {
       if (job.total_segments > 0) {
         const pct = Math.round((job.downloaded_segments / job.total_segments) * 100);
         document.getElementById('progressBar').style.width = pct + '%';
+        const fileProgress = job.total_files > 1 ? `파일 ${job.current_file || 1} / ${job.total_files} · ` : '';
         document.getElementById('progressText').textContent =
-          `${job.downloaded_segments} / ${job.total_segments} 세그먼트 (${pct}%)`;
+          `${fileProgress}${job.downloaded_segments} / ${job.total_segments} 세그먼트 (${pct}%)`;
       }
     }
   } catch (e) { /* ignore poll errors */ }
@@ -331,20 +396,77 @@ function showError(msg) {
 function showResult(job) {
   document.getElementById('statusCard').classList.remove('active');
   document.getElementById('resultCard').classList.add('active');
-  document.getElementById('resultInfo').textContent = `${job.filename} (${formatSize(job.file_size)})`;
+  const files = job.files && job.files.length
+    ? [...job.files]
+    : (job.filename ? [{ filename: job.filename, file_size: job.file_size }] : []);
+  const downloadDir = job.download_dir || '~/Downloads/HLS-Downloader';
+  const resultList = document.getElementById('resultList');
+  resultList.innerHTML = '';
 
-  const saveBtn = document.getElementById('saveBtn');
-  saveBtn.onclick = () => {
-    window.location.href = `/api/file/${job.filename}`;
-  };
+  updateResultSummary(files, downloadDir);
 
-  const deleteBtn = document.getElementById('deleteBtn');
-  deleteBtn.onclick = async () => {
-    await fetch(`/api/cleanup/${job.filename}`, { method: 'DELETE' });
-    resetUI();
-    document.getElementById('downloadBtn').disabled = false;
-    document.getElementById('urlInput').disabled = false;
-  };
+  files.forEach((file) => {
+    const row = document.createElement('div');
+    row.className = 'result-file';
+
+    const main = document.createElement('div');
+    main.className = 'file-main';
+
+    const name = document.createElement('div');
+    name.className = 'file-name';
+    name.textContent = file.filename;
+
+    const size = document.createElement('div');
+    size.className = 'file-size';
+    size.textContent = formatSize(file.file_size || 0);
+
+    const actions = document.createElement('div');
+    actions.className = 'file-actions';
+
+    const revealBtn = document.createElement('button');
+    revealBtn.className = 'btn-download';
+    revealBtn.textContent = '폴더 열기';
+    revealBtn.onclick = async () => {
+      revealBtn.disabled = true;
+      try {
+        await fetch(`/api/reveal/${encodeURIComponent(file.filename)}`, { method: 'POST' });
+      } finally {
+        revealBtn.disabled = false;
+      }
+    };
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'btn-delete';
+    deleteBtn.textContent = '삭제';
+    deleteBtn.onclick = async () => {
+      await fetch(`/api/cleanup/${encodeURIComponent(file.filename)}`, { method: 'DELETE' });
+      const index = files.indexOf(file);
+      if (index >= 0) files.splice(index, 1);
+      row.remove();
+      if (files.length === 0) {
+        resetUI();
+      } else {
+        updateResultSummary(files, downloadDir);
+      }
+    };
+
+    main.appendChild(name);
+    main.appendChild(size);
+    actions.appendChild(revealBtn);
+    actions.appendChild(deleteBtn);
+    row.appendChild(main);
+    row.appendChild(actions);
+    resultList.appendChild(row);
+  });
+}
+
+function updateResultSummary(files, downloadDir) {
+  const totalSize = files.reduce((sum, file) => sum + (file.file_size || 0), 0);
+  document.getElementById('resultInfo').textContent =
+    files.length === 1
+      ? `${files[0].filename} (${formatSize(totalSize)})`
+      : `${files.length}개 파일 저장됨 (${formatSize(totalSize)})`;
+  document.getElementById('downloadPath').textContent = `저장 위치: ${downloadDir}`;
 }
 
 document.getElementById('urlInput').addEventListener('keydown', (e) => {

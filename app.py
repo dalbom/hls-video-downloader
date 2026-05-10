@@ -163,6 +163,18 @@ def discover_media_sources(page_url, max_iframes=5):
     return dedupe(m3u8_urls), dedupe(mp4_urls)
 
 
+def output_name_for_job(job_id, index, total):
+    if total > 1:
+        return f"video_{job_id}_{index:03d}.mp4"
+    return f"video_{job_id}.mp4"
+
+
+def preferred_media_sources(m3u8_sources, mp4_sources):
+    if m3u8_sources:
+        return [("hls", url, referer_url) for url, referer_url in m3u8_sources]
+    return [("mp4", url, referer_url) for url, referer_url in mp4_sources]
+
+
 def parse_m3u8(content, base_url):
     """m3u8 내용에서 세그먼트 URL 목록을 추출한다."""
     segments = []
@@ -332,6 +344,46 @@ def has_valid_output(result, output_path):
     )
 
 
+def ffmpeg_creationflags():
+    return subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+
+
+def source_metadata_args(source_url):
+    source_value = f"Source URL: {source_url}"
+    return [
+        "-metadata", f"comment={source_value}",
+        "-metadata", f"description={source_value}",
+    ]
+
+
+def apply_source_metadata(output_path, source_url):
+    tmp_path = output_path.with_name(f"{output_path.stem}.metadata{output_path.suffix}")
+    try:
+        cmd = [
+            FFMPEG_BIN,
+            "-i", str(output_path),
+            "-c", "copy",
+            *source_metadata_args(source_url),
+            str(tmp_path),
+            "-y",
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            creationflags=ffmpeg_creationflags(),
+        )
+        if not has_valid_output(result, tmp_path):
+            tmp_path.unlink(missing_ok=True)
+            return False
+        tmp_path.replace(output_path)
+        return True
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
 def create_local_hls_playlist(content, playlist_url, tmp_dir, segment_count, referer_url):
     key_uri = hls_key_uri(content)
     if not key_uri:
@@ -362,77 +414,57 @@ def create_local_hls_playlist(content, playlist_url, tmp_dir, segment_count, ref
     return playlist_path
 
 
-def process_download(job_id, page_url):
-    """전체 다운로드 프로세스를 실행한다."""
+def add_completed_file(job, output_name, output_path):
+    file_info = {
+        "filename": output_name,
+        "file_size": output_path.stat().st_size,
+    }
+    job.setdefault("files", []).append(file_info)
+    job["file_size"] = sum(file["file_size"] for file in job["files"])
+    job["filename"] = file_info["filename"] if len(job["files"]) == 1 else None
+    return file_info
+
+
+def download_mp4_source(job_id, media_url, media_referer_url, output_path, item_label, source_url):
     job = jobs[job_id]
+    job["status"] = f"Downloading video {item_label}..."
+    downloaded = download_direct_media(job_id, media_url, media_referer_url, output_path)
+
+    if job_id in cancelled_jobs:
+        raise InterruptedError("cancelled")
+
+    if not downloaded or not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("Download failed")
+
+    apply_source_metadata(output_path, source_url)
+
+
+def download_hls_source(job_id, m3u8_url, media_referer_url, output_path, item_label, source_url):
+    job = jobs[job_id]
+    job["status"] = f"Analyzing playlist {item_label}..."
+    m3u8_content, segments, resolved_m3u8_url = resolve_m3u8(
+        m3u8_url,
+        referer_url=media_referer_url,
+        include_url=True,
+    )
+
+    if not segments:
+        raise RuntimeError("No video segments found")
+
+    job["total_segments"] = len(segments)
+    job["downloaded_segments"] = 0
+    encrypted_playlist = is_encrypted_playlist(m3u8_content or "")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="hls_"))
+    job["tmp_dir"] = str(tmp_dir)
 
     try:
-        # 1. 페이지와 임베드 플레이어에서 동영상 URL 찾기
-        job["status"] = "페이지 분석 중..."
-        m3u8_sources, mp4_sources = discover_media_sources(page_url)
-
-        if not m3u8_sources and not mp4_sources:
-            job["status"] = "error"
-            job["error"] = "동영상 URL을 찾을 수 없습니다."
-            return
-
-        if not m3u8_sources:
-            media_url, media_referer_url = mp4_sources[0]
-            output_name = f"video_{job_id}.mp4"
-            output_path = DOWNLOAD_DIR / output_name
-
-            job["status"] = "동영상 다운로드 중..."
-            downloaded = download_direct_media(job_id, media_url, media_referer_url, output_path)
-
-            if job_id in cancelled_jobs:
-                raise InterruptedError("cancelled")
-
-            if not downloaded or not output_path.exists() or output_path.stat().st_size == 0:
-                job["status"] = "error"
-                job["error"] = "다운로드 실패"
-                return
-
-            file_size = output_path.stat().st_size
-            job["status"] = "done"
-            job["filename"] = output_name
-            job["file_size"] = file_size
-            return
-
-        # 2. m3u8에서 세그먼트 추출
-        job["status"] = "플레이리스트 분석 중..."
-        m3u8_content = None
-        resolved_m3u8_url = None
-        selected_referer_url = page_url
-        segments = []
-        for m3u8_url, media_referer_url in m3u8_sources:
-            m3u8_content, segments, resolved_m3u8_url = resolve_m3u8(
-                m3u8_url,
-                referer_url=media_referer_url,
-                include_url=True,
-            )
-            if segments:
-                selected_referer_url = media_referer_url
-                break
-
-        if not segments:
-            job["status"] = "error"
-            job["error"] = "세그먼트를 찾을 수 없습니다."
-            return
-
-        job["total_segments"] = len(segments)
-        job["downloaded_segments"] = 0
-        encrypted_playlist = is_encrypted_playlist(m3u8_content or "")
-
-        # 3. 임시 디렉토리에 세그먼트 다운로드
-        tmp_dir = Path(tempfile.mkdtemp(prefix="hls_"))
-        job["tmp_dir"] = str(tmp_dir)
-
-        job["status"] = "세그먼트 다운로드 중..."
+        job["status"] = f"Downloading segments {item_label}..."
         tasks = []
         for i, seg_url in enumerate(segments):
             ext = ".ts" if encrypted_playlist else (Path(seg_url.split("?")[0]).suffix or ".ts")
             filepath = tmp_dir / f"segment_{i:05d}{ext}"
-            tasks.append((seg_url, str(filepath), job_id, selected_referer_url))
+            tasks.append((seg_url, str(filepath), job_id, media_referer_url))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(download_segment, t): t for t in tasks}
@@ -440,22 +472,21 @@ def process_download(job_id, page_url):
                 if job_id in cancelled_jobs:
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise InterruptedError("cancelled")
-                result = future.result()
+                if not future.result():
+                    raise RuntimeError("Segment download failed")
                 job["downloaded_segments"] += 1
 
         if job_id in cancelled_jobs:
             raise InterruptedError("cancelled")
 
-        # 4. ffmpeg로 합치기
-        job["status"] = "동영상 병합 중..."
-
+        job["status"] = f"Merging video {item_label}..."
         if encrypted_playlist:
             input_path = create_local_hls_playlist(
                 m3u8_content,
                 resolved_m3u8_url,
                 tmp_dir,
                 len(segments),
-                selected_referer_url,
+                media_referer_url,
             )
             input_args = [
                 FFMPEG_BIN,
@@ -473,41 +504,77 @@ def process_download(job_id, page_url):
                 "-i", str(concat_file),
             ]
 
-        output_name = f"video_{job_id}.mp4"
-        output_path = DOWNLOAD_DIR / output_name
-
-        cmd = input_args + ["-c", "copy", "-bsf:a", "aac_adtstoasc", str(output_path), "-y"]
+        metadata_args = source_metadata_args(source_url)
+        cmd = input_args + ["-c", "copy", "-bsf:a", "aac_adtstoasc", *metadata_args, str(output_path), "-y"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
+                                creationflags=ffmpeg_creationflags())
 
         if not has_valid_output(result, output_path):
-            cmd = input_args + ["-c", "copy", str(output_path), "-y"]
+            cmd = input_args + ["-c", "copy", *metadata_args, str(output_path), "-y"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                                    creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
+                                    creationflags=ffmpeg_creationflags())
 
         if not has_valid_output(result, output_path):
+            raise RuntimeError(f"Merge failed: {result.stderr[-500:]}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if job.get("tmp_dir") == str(tmp_dir):
+            job.pop("tmp_dir", None)
+
+
+def process_download(job_id, page_url):
+    job = jobs[job_id]
+
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        job["download_dir"] = str(DOWNLOAD_DIR)
+        job["files"] = []
+        job["total_files"] = 0
+        job["downloaded_files"] = 0
+        job["status"] = "Analyzing page..."
+
+        m3u8_sources, mp4_sources = discover_media_sources(page_url)
+        sources = preferred_media_sources(m3u8_sources, mp4_sources)
+
+        if not sources:
             job["status"] = "error"
-            job["error"] = f"병합 실패: {result.stderr[-500:]}"
+            job["error"] = "No video URLs found."
             return
 
-        # 5. 정리
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        total_files = len(sources)
+        job["total_files"] = total_files
 
-        file_size = output_path.stat().st_size
+        for index, (source_type, media_url, media_referer_url) in enumerate(sources, start=1):
+            if job_id in cancelled_jobs:
+                raise InterruptedError("cancelled")
+
+            job["current_file"] = index
+            item_label = f"{index}/{total_files}"
+            output_name = output_name_for_job(job_id, index, total_files)
+            output_path = DOWNLOAD_DIR / output_name
+
+            if source_type == "mp4":
+                download_mp4_source(job_id, media_url, media_referer_url, output_path, item_label, page_url)
+            else:
+                download_hls_source(job_id, media_url, media_referer_url, output_path, item_label, page_url)
+
+            add_completed_file(job, output_name, output_path)
+            job["downloaded_files"] = index
+
         job["status"] = "done"
-        job["filename"] = output_name
-        job["file_size"] = file_size
 
     except InterruptedError:
         job["status"] = "cancelled"
         if "tmp_dir" in job:
             shutil.rmtree(job["tmp_dir"], ignore_errors=True)
+            job.pop("tmp_dir", None)
         cancelled_jobs.discard(job_id)
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
         if "tmp_dir" in job:
             shutil.rmtree(job["tmp_dir"], ignore_errors=True)
+            job.pop("tmp_dir", None)
 
 
 @app.route("/")
@@ -530,6 +597,10 @@ def start_download():
         "error": None,
         "filename": None,
         "file_size": None,
+        "files": [],
+        "total_files": 0,
+        "downloaded_files": 0,
+        "download_dir": str(DOWNLOAD_DIR),
     }
 
     t = Thread(target=process_download, args=(job_id, page_url), daemon=True)
@@ -565,14 +636,49 @@ def download_file(filename):
     return send_file(filepath, as_attachment=True, download_name=safe_name)
 
 
+def open_download_location(filepath):
+    folder = filepath.parent
+    if platform.system() == "Windows":
+        os.startfile(folder)
+    elif platform.system() == "Darwin":
+        subprocess.Popen(["open", str(folder)])
+    else:
+        subprocess.Popen(["xdg-open", str(folder)])
+
+
+@app.route("/api/reveal/<filename>", methods=["POST"])
+def reveal_file(filename):
+    safe_name = Path(filename).name
+    filepath = DOWNLOAD_DIR / safe_name
+    if not filepath.exists():
+        return jsonify({"error": "?뚯씪??李얠쓣 ???놁뒿?덈떎."}), 404
+    try:
+        open_download_location(filepath)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/cleanup/<filename>", methods=["DELETE"])
 def cleanup_file(filename):
     safe_name = Path(filename).name
     filepath = DOWNLOAD_DIR / safe_name
     if filepath.exists():
         filepath.unlink()
-    if job_id := next((k for k, v in jobs.items() if v.get("filename") == safe_name), None):
-        del jobs[job_id]
+
+    for job_id, job in list(jobs.items()):
+        files = job.get("files") or []
+        if files:
+            job["files"] = [file for file in files if file.get("filename") != safe_name]
+            job["file_size"] = sum(file.get("file_size", 0) for file in job["files"])
+            if job.get("filename") == safe_name:
+                job["filename"] = job["files"][0]["filename"] if len(job["files"]) == 1 else None
+            if not job["files"]:
+                del jobs[job_id]
+            continue
+
+        if job.get("filename") == safe_name:
+            del jobs[job_id]
     return jsonify({"ok": True})
 
 

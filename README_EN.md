@@ -13,6 +13,7 @@ Enter a video page URL and it will automatically detect the HLS stream, download
 - Fast segment download with 10 parallel connections
 - Real-time progress display
 - Download cancellation
+- Stores the source page URL in downloaded MP4 metadata
 - Automatic segment cleanup after merge
 
 ## Installation & Usage
@@ -64,8 +65,8 @@ Open the `http://127.0.0.1:<port>` address printed in the terminal, then enter a
 1. Enter the URL of a page containing a video
 2. Click **Download**
 3. Monitor progress (cancel anytime)
-4. Click **Save File** to download the MP4
-5. Optionally click **Delete from Server** to clean up
+4. Open the saved file from `~/Downloads/HLS-Downloader/`
+5. Optionally click **Delete** to remove the saved file
 
 ## Disclaimer
 
