@@ -28,6 +28,8 @@ No installation required.
 3. Run `HLS-Downloader`
 4. Your browser will open automatically
 
+On Windows systems where port 5000 is unavailable, the app automatically uses another local port.
+
 Downloaded videos are saved to `~/Downloads/HLS-Downloader/`.
 
 ### Option 2: Run from source
@@ -55,7 +57,7 @@ pip install flask requests
 python app.py
 ```
 
-Open http://localhost:5000 in your browser and enter a video page URL.
+Open the `http://127.0.0.1:<port>` address printed in the terminal, then enter a video page URL.
 
 ## How to Use
 

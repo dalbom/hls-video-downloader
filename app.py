@@ -2,6 +2,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,9 @@ else:
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 
+HOST = "127.0.0.1"
+DEFAULT_PORT = 5000
+
 DOWNLOAD_DIR = Path.home() / "Downloads" / "HLS-Downloader"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -35,11 +39,18 @@ jobs = {}
 cancelled_jobs = set()
 
 
-def fetch_page(url):
-    """페이지 HTML 소스를 가져온다."""
+def request_headers(referer_url=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
+    if referer_url:
+        headers["Referer"] = referer_url
+    return headers
+
+
+def fetch_page(url):
+    """페이지 HTML 소스를 가져온다."""
+    headers = request_headers()
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
@@ -107,16 +118,31 @@ def is_master_playlist(content):
     return "#EXT-X-STREAM-INF" in content
 
 
-def resolve_m3u8(url):
+def hls_key_uri(content):
+    for line in content.splitlines():
+        if not line.startswith("#EXT-X-KEY"):
+            continue
+        if "METHOD=AES-128" not in line:
+            return None
+        match = re.search(r'URI="([^"]+)"', line)
+        return match.group(1) if match else None
+    return None
+
+
+def is_encrypted_playlist(content):
+    return hls_key_uri(content) is not None
+
+
+def resolve_m3u8(url, referer_url=None, include_url=False):
     """m3u8 URL을 받아 세그먼트 목록을 반환한다. 마스터면 최고 품질 선택."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers = request_headers(referer_url)
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     content = resp.text
 
     if not content.strip().startswith("#EXTM3U"):
+        if include_url:
+            return None, [], url
         return None, []
 
     if is_master_playlist(content):
@@ -134,21 +160,27 @@ def resolve_m3u8(url):
                     best_bw = bw
                     best_url = next_line
         if best_url:
-            return resolve_m3u8(best_url)
+            return resolve_m3u8(best_url, referer_url=referer_url, include_url=include_url)
+        if include_url:
+            return None, [], url
         return None, []
 
     segments = parse_m3u8(content, url)
+    if include_url:
+        return content, segments, url
     return content, segments
 
 
 def download_segment(args):
     """세그먼트 하나를 다운로드한다."""
-    url, filepath, job_id = args
+    if len(args) == 4:
+        url, filepath, job_id, referer_url = args
+    else:
+        url, filepath, job_id = args
+        referer_url = None
     if job_id in cancelled_jobs:
         return False
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers = request_headers(referer_url)
     for attempt in range(3):
         if job_id in cancelled_jobs:
             return False
@@ -162,6 +194,44 @@ def download_segment(args):
             if attempt == 2:
                 return False
             time.sleep(1)
+
+
+def has_valid_output(result, output_path):
+    return (
+        result.returncode == 0
+        and output_path.exists()
+        and output_path.stat().st_size > 0
+    )
+
+
+def create_local_hls_playlist(content, playlist_url, tmp_dir, segment_count, referer_url):
+    key_uri = hls_key_uri(content)
+    if not key_uri:
+        return None
+
+    key_url = urljoin(playlist_url, key_uri)
+    resp = requests.get(key_url, headers=request_headers(referer_url), timeout=30)
+    resp.raise_for_status()
+    key_path = tmp_dir / "key.bin"
+    key_path.write_bytes(resp.content)
+
+    local_lines = []
+    segment_index = 0
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-KEY"):
+            local_lines.append(re.sub(r'URI="[^"]+"', 'URI="key.bin"', line))
+        elif stripped and not stripped.startswith("#"):
+            if segment_index >= segment_count:
+                continue
+            local_lines.append(f"segment_{segment_index:05d}.ts")
+            segment_index += 1
+        else:
+            local_lines.append(line)
+
+    playlist_path = tmp_dir / "local_video.m3u8"
+    playlist_path.write_text("\n".join(local_lines) + "\n", encoding="utf-8")
+    return playlist_path
 
 
 def process_download(job_id, page_url):
@@ -182,9 +252,14 @@ def process_download(job_id, page_url):
         # 2. m3u8에서 세그먼트 추출
         job["status"] = "플레이리스트 분석 중..."
         m3u8_content = None
+        resolved_m3u8_url = None
         segments = []
         for m3u8_url in m3u8_urls:
-            m3u8_content, segments = resolve_m3u8(m3u8_url)
+            m3u8_content, segments, resolved_m3u8_url = resolve_m3u8(
+                m3u8_url,
+                referer_url=page_url,
+                include_url=True,
+            )
             if segments:
                 break
 
@@ -195,6 +270,7 @@ def process_download(job_id, page_url):
 
         job["total_segments"] = len(segments)
         job["downloaded_segments"] = 0
+        encrypted_playlist = is_encrypted_playlist(m3u8_content or "")
 
         # 3. 임시 디렉토리에 세그먼트 다운로드
         tmp_dir = Path(tempfile.mkdtemp(prefix="hls_"))
@@ -203,9 +279,9 @@ def process_download(job_id, page_url):
         job["status"] = "세그먼트 다운로드 중..."
         tasks = []
         for i, seg_url in enumerate(segments):
-            ext = Path(seg_url.split("?")[0]).suffix or ".ts"
+            ext = ".ts" if encrypted_playlist else (Path(seg_url.split("?")[0]).suffix or ".ts")
             filepath = tmp_dir / f"segment_{i:05d}{ext}"
-            tasks.append((seg_url, str(filepath), job_id))
+            tasks.append((seg_url, str(filepath), job_id, page_url))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(download_segment, t): t for t in tasks}
@@ -222,36 +298,43 @@ def process_download(job_id, page_url):
         # 4. ffmpeg로 합치기
         job["status"] = "동영상 병합 중..."
 
-        concat_file = tmp_dir / "concat.txt"
-        with open(concat_file, "w") as f:
-            for i in range(len(segments)):
-                ext = Path(segments[i].split("?")[0]).suffix or ".ts"
-                f.write(f"file 'segment_{i:05d}{ext}'\n")
+        if encrypted_playlist:
+            input_path = create_local_hls_playlist(
+                m3u8_content,
+                resolved_m3u8_url,
+                tmp_dir,
+                len(segments),
+                page_url,
+            )
+            input_args = [
+                FFMPEG_BIN,
+                "-allowed_extensions", "ALL",
+                "-i", str(input_path),
+            ]
+        else:
+            concat_file = tmp_dir / "concat.txt"
+            with open(concat_file, "w") as f:
+                for i in range(len(segments)):
+                    ext = Path(segments[i].split("?")[0]).suffix or ".ts"
+                    f.write(f"file 'segment_{i:05d}{ext}'\n")
+            input_args = [
+                FFMPEG_BIN, "-f", "concat", "-safe", "0",
+                "-i", str(concat_file),
+            ]
 
         output_name = f"video_{job_id}.mp4"
         output_path = DOWNLOAD_DIR / output_name
 
-        cmd = [
-            FFMPEG_BIN, "-f", "concat", "-safe", "0",
-            "-i", str(concat_file),
-            "-c", "copy", "-bsf:a", "aac_adtstoasc",
-            str(output_path), "-y"
-        ]
+        cmd = input_args + ["-c", "copy", "-bsf:a", "aac_adtstoasc", str(output_path), "-y"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                                 creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
 
-        if result.returncode != 0 and not output_path.exists():
-            # bsf 없이 재시도
-            cmd = [
-                FFMPEG_BIN, "-f", "concat", "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",
-                str(output_path), "-y"
-            ]
+        if not has_valid_output(result, output_path):
+            cmd = input_args + ["-c", "copy", str(output_path), "-y"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                                     creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
 
-        if not output_path.exists():
+        if not has_valid_output(result, output_path):
             job["status"] = "error"
             job["error"] = f"병합 실패: {result.stderr[-500:]}"
             return
@@ -342,12 +425,34 @@ def cleanup_file(filename):
     return jsonify({"ok": True})
 
 
-def open_browser():
-    webbrowser.open("http://localhost:5000")
+def find_available_port(host=HOST, preferred_port=DEFAULT_PORT):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, preferred_port))
+        return preferred_port
+    except OSError:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return sock.getsockname()[1]
+
+
+def app_url(host, port):
+    return f"http://{host}:{port}"
+
+
+def open_browser(host, port):
+    webbrowser.open(app_url(host, port))
+
+
+def run_desktop_app(is_frozen=None):
+    if is_frozen is None:
+        is_frozen = getattr(sys, "frozen", False)
+    port = find_available_port(HOST, DEFAULT_PORT)
+    print(f"HLS Video Downloader running at {app_url(HOST, port)}", flush=True)
+    if is_frozen:
+        Timer(1.5, open_browser, args=(HOST, port)).start()
+    app.run(host=HOST, port=port, debug=not is_frozen, use_reloader=False)
 
 
 if __name__ == "__main__":
-    is_frozen = getattr(sys, "frozen", False)
-    if is_frozen:
-        Timer(1.5, open_browser).start()
-    app.run(host="127.0.0.1", port=5000, debug=not is_frozen)
+    run_desktop_app()
