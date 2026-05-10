@@ -29,6 +29,7 @@ app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
+DIRECT_MEDIA_RANGE_SIZE = 1 * 1024 * 1024
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "HLS-Downloader"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,12 +49,20 @@ def request_headers(referer_url=None):
     return headers
 
 
-def fetch_page(url):
+def fetch_page(url, referer_url=None):
     """페이지 HTML 소스를 가져온다."""
-    headers = request_headers()
+    headers = request_headers(referer_url)
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.text
+
+
+def normalize_url(url, page_url):
+    if url.startswith("//"):
+        return "https:" + url
+    if not url.startswith("http"):
+        return urljoin(page_url, url)
+    return url
 
 
 def find_m3u8_urls(html, page_url):
@@ -68,9 +77,7 @@ def find_m3u8_urls(html, page_url):
     for pattern in patterns:
         for match in re.finditer(pattern, html, re.IGNORECASE):
             url = match.group(1)
-            if not url.startswith("http"):
-                url = urljoin(page_url, url)
-            urls.append(url)
+            urls.append(normalize_url(url, page_url))
 
     # 2단계: mpegURL type이 지정된 source 태그에서 확장자 무관하게 추출
     for match in re.finditer(
@@ -78,18 +85,14 @@ def find_m3u8_urls(html, page_url):
         html, re.IGNORECASE
     ):
         url = match.group(1)
-        if not url.startswith("http"):
-            url = urljoin(page_url, url)
-        urls.append(url)
+        urls.append(normalize_url(url, page_url))
     # type이 src보다 앞에 오는 경우
     for match in re.finditer(
         r'<source\s+[^>]*type=["\']application/x-mpegURL["\'][^>]*src=["\']([^"\']+)["\']',
         html, re.IGNORECASE
     ):
         url = match.group(1)
-        if not url.startswith("http"):
-            url = urljoin(page_url, url)
-        urls.append(url)
+        urls.append(normalize_url(url, page_url))
 
     # 중복 제거, 순서 유지
     seen = set()
@@ -99,6 +102,65 @@ def find_m3u8_urls(html, page_url):
             seen.add(u)
             unique.append(u)
     return unique
+
+
+def find_mp4_urls(html, page_url):
+    patterns = [
+        r'<source\s+[^>]*src=["\']([^"\']+\.mp4[^"\']*)["\']',
+        r'<video\s+[^>]*src=["\']([^"\']+\.mp4[^"\']*)["\']',
+        r'["\']([^"\']*\.mp4[^"\']*)["\']',
+    ]
+    urls = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, re.IGNORECASE):
+            urls.append(normalize_url(match.group(1), page_url))
+
+    seen = set()
+    unique = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def find_iframe_urls(html, page_url):
+    urls = []
+    for match in re.finditer(r'<iframe\s+[^>]*src=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        urls.append(normalize_url(match.group(1), page_url))
+
+    seen = set()
+    unique = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def discover_media_sources(page_url, max_iframes=5):
+    html = fetch_page(page_url)
+    m3u8_urls = [(url, page_url) for url in find_m3u8_urls(html, page_url)]
+    mp4_urls = [(url, page_url) for url in find_mp4_urls(html, page_url)]
+
+    for iframe_url in find_iframe_urls(html, page_url)[:max_iframes]:
+        try:
+            iframe_html = fetch_page(iframe_url, referer_url=page_url)
+        except Exception:
+            continue
+        m3u8_urls.extend((url, iframe_url) for url in find_m3u8_urls(iframe_html, iframe_url))
+        mp4_urls.extend((url, iframe_url) for url in find_mp4_urls(iframe_html, iframe_url))
+
+    def dedupe(pairs):
+        seen = set()
+        unique = []
+        for url, referer_url in pairs:
+            if url not in seen:
+                seen.add(url)
+                unique.append((url, referer_url))
+        return unique
+
+    return dedupe(m3u8_urls), dedupe(mp4_urls)
 
 
 def parse_m3u8(content, base_url):
@@ -196,6 +258,72 @@ def download_segment(args):
             time.sleep(1)
 
 
+def content_range_total(content_range):
+    if not content_range:
+        return None
+    match = re.search(r"/(\d+)$", content_range)
+    return int(match.group(1)) if match else None
+
+
+def download_direct_media(job_id, media_url, referer_url, output_path, range_size=DIRECT_MEDIA_RANGE_SIZE):
+    job = jobs[job_id]
+    start = 0
+    total_size = None
+    completed_ranges = 0
+    bytes_written = 0
+
+    job["total_segments"] = 1
+    job["downloaded_segments"] = 0
+
+    with open(output_path, "wb") as f:
+        while True:
+            if job_id in cancelled_jobs:
+                return False
+
+            end = start + range_size - 1
+            headers = request_headers(referer_url)
+            headers["Range"] = f"bytes={start}-{end}"
+
+            with requests.get(media_url, headers=headers, stream=True, timeout=(10, 60)) as resp:
+                if resp.status_code == 416 and bytes_written > 0:
+                    break
+                resp.raise_for_status()
+
+                status_code = resp.status_code
+                if total_size is None:
+                    total_size = content_range_total(resp.headers.get("Content-Range"))
+                    if total_size:
+                        job["total_segments"] = max(1, (total_size + range_size - 1) // range_size)
+                if status_code == 200:
+                    total_size = int(resp.headers.get("Content-Length") or 0) or total_size
+
+                response_bytes = 0
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if job_id in cancelled_jobs:
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        response_bytes += len(chunk)
+                        bytes_written += len(chunk)
+
+            if response_bytes == 0:
+                return False
+
+            completed_ranges += 1
+            job["downloaded_segments"] = completed_ranges
+
+            if status_code == 200:
+                break
+
+            start += response_bytes
+            if total_size is not None and start >= total_size:
+                break
+            if total_size is None and response_bytes < range_size:
+                break
+
+    return bytes_written > 0
+
+
 def has_valid_output(result, output_path):
     return (
         result.returncode == 0
@@ -239,28 +367,51 @@ def process_download(job_id, page_url):
     job = jobs[job_id]
 
     try:
-        # 1. 페이지에서 m3u8 URL 찾기
+        # 1. 페이지와 임베드 플레이어에서 동영상 URL 찾기
         job["status"] = "페이지 분석 중..."
-        html = fetch_page(page_url)
-        m3u8_urls = find_m3u8_urls(html, page_url)
+        m3u8_sources, mp4_sources = discover_media_sources(page_url)
 
-        if not m3u8_urls:
+        if not m3u8_sources and not mp4_sources:
             job["status"] = "error"
             job["error"] = "동영상 URL을 찾을 수 없습니다."
+            return
+
+        if not m3u8_sources:
+            media_url, media_referer_url = mp4_sources[0]
+            output_name = f"video_{job_id}.mp4"
+            output_path = DOWNLOAD_DIR / output_name
+
+            job["status"] = "동영상 다운로드 중..."
+            downloaded = download_direct_media(job_id, media_url, media_referer_url, output_path)
+
+            if job_id in cancelled_jobs:
+                raise InterruptedError("cancelled")
+
+            if not downloaded or not output_path.exists() or output_path.stat().st_size == 0:
+                job["status"] = "error"
+                job["error"] = "다운로드 실패"
+                return
+
+            file_size = output_path.stat().st_size
+            job["status"] = "done"
+            job["filename"] = output_name
+            job["file_size"] = file_size
             return
 
         # 2. m3u8에서 세그먼트 추출
         job["status"] = "플레이리스트 분석 중..."
         m3u8_content = None
         resolved_m3u8_url = None
+        selected_referer_url = page_url
         segments = []
-        for m3u8_url in m3u8_urls:
+        for m3u8_url, media_referer_url in m3u8_sources:
             m3u8_content, segments, resolved_m3u8_url = resolve_m3u8(
                 m3u8_url,
-                referer_url=page_url,
+                referer_url=media_referer_url,
                 include_url=True,
             )
             if segments:
+                selected_referer_url = media_referer_url
                 break
 
         if not segments:
@@ -281,7 +432,7 @@ def process_download(job_id, page_url):
         for i, seg_url in enumerate(segments):
             ext = ".ts" if encrypted_playlist else (Path(seg_url.split("?")[0]).suffix or ".ts")
             filepath = tmp_dir / f"segment_{i:05d}{ext}"
-            tasks.append((seg_url, str(filepath), job_id, page_url))
+            tasks.append((seg_url, str(filepath), job_id, selected_referer_url))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(download_segment, t): t for t in tasks}
@@ -304,7 +455,7 @@ def process_download(job_id, page_url):
                 resolved_m3u8_url,
                 tmp_dir,
                 len(segments),
-                page_url,
+                selected_referer_url,
             )
             input_args = [
                 FFMPEG_BIN,
